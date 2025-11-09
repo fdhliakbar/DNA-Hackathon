@@ -8,6 +8,13 @@ from typing import Optional
 from app.api.routers.circlo import get_circlo_client
 from app.core.circlo_client import CircloClient
 from app.core import llm as llm_module
+import httpx
+from datetime import datetime, time, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    # Python <3.9 fallback - schedulers should install backports.zoneinfo if needed
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 # Try to import langdetect; if not installed we'll fall back to a tiny detector
 try:
@@ -169,6 +176,50 @@ async def haruhi_hook(request: Request):
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
 
     reply = _llm.chat(messages) if _llm.available() else None
+
+    # Handle demo orchestration requests: find 3 AI experts in Singapore and schedule 30-min invites
+    demo_match = re.search(r"find.*3.*ai.*expert.*singapore|find.*3.*agentic.*ai.*experts.*singapore|send.*meeting.*invitations.*30|30[- ]?min", (message or "").lower())
+    if demo_match:
+        # call local orchestrator to perform the expert search and return an HTML summary
+        try:
+            # compute next Tuesday afternoon in Asia/Singapore (14:00 local) for a 30-min slot
+            tz = ZoneInfo("Asia/Singapore")
+            now = datetime.now(tz)
+            target_weekday = 1  # Tuesday (Mon=0)
+            days_ahead = (target_weekday - now.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            next_tuesday = (now + timedelta(days=days_ahead)).date()
+            start_dt = datetime.combine(next_tuesday, time(hour=14, minute=0), tzinfo=tz)
+            end_dt = start_dt + timedelta(minutes=30)
+            start_iso = start_dt.isoformat()
+            end_iso = end_dt.isoformat()
+
+            async with httpx.AsyncClient(timeout=30.0) as hc:
+                payload = {"message": message, "user": {"id": user.get("id") if isinstance(user, dict) else None}, "auto_schedule": True, "start_iso": start_iso, "end_iso": end_iso}
+                resp = await hc.post("http://127.0.0.1:8000/orchestrator/execute", json=payload)
+                if resp.status_code == 200:
+                    # try to post a short confirmation to Circlo so the agent page shows activity
+                    try:
+                        client = CircloClient()
+                        await client.create_post({"title": "Orchestrator ran: find experts","body": f"Requested: {message}", "user_id": user.get("id") if isinstance(user, dict) else None})
+                        await client.close()
+                    except Exception:
+                        pass
+                    # Build a richer confirmation HTML including CTA to user's Google Calendar + orchestrator output
+                    orchestrator_html = resp.text
+                    confirm_html = ["<html><head><meta charset='utf-8'><title>Haruhi — Demo Result</title></head><body style='font-family:Arial,Helvetica,sans-serif;padding:20px;'>"]
+                    confirm_html.append(f"<h2>Orchestrator ran for your request</h2>")
+                    confirm_html.append(f"<p>I've searched for 3 AI experts in Singapore and attempted to schedule 30-minute introductions on <strong>{start_dt.strftime('%A, %d %B %Y')}</strong> at <strong>{start_dt.strftime('%H:%M')}</strong> (Asia/Singapore).</p>")
+                    confirm_html.append("<p>You can open your Google Calendar to review the invites:</p>")
+                    confirm_html.append("<p><a href='https://calendar.google.com/calendar/r' target='_blank' style='background:#0f9d58;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;'>Open Google Calendar</a></p>")
+                    confirm_html.append("<hr/><h3>Details from orchestrator:</h3>")
+                    confirm_html.append(orchestrator_html)
+                    confirm_html.append("</body></html>")
+                    return HTMLResponse(content='\n'.join(confirm_html))
+        except Exception:
+            # fall through to LLM / fallback reply
+            pass
     if wants_html:
         # render html reply
         html = reply or (f"Haruhi Agent di sini - saya menerima pesan Anda: {message}" if lang == 'id' else f"Haruhi Agent here - I received your message: {message}")
