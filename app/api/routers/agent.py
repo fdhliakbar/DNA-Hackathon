@@ -1,334 +1,194 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
-import logging
-import re
-import time
-from typing import Optional
-
-from app.api.routers.circlo import get_circlo_client
-from app.core.circlo_client import CircloClient
-from app.core import llm as llm_module
+# ...existing code...
+from fastapi import APIRouter
+from pydantic import BaseModel
+from app.core.llm import LLMClient
+from typing import List, Dict, Any
+import json
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import httpx
-from datetime import datetime, time, timedelta
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    # Python <3.9 fallback - schedulers should install backports.zoneinfo if needed
-    from backports.zoneinfo import ZoneInfo  # type: ignore
 
-# Try to import langdetect; if not installed we'll fall back to a tiny detector
-try:
-    from langdetect import detect
-except Exception:
-    def detect(text: str) -> str:  # type: ignore
-        if not text:
-            return "en"
-        t = text.lower()
-        if any(k in t for k in ("halo", "apa", "bagaimana", "terima", "kamu", "saya")):
-            return "id"
-        if any(k in t for k in ("hola", "gracias")):
-            return "es"
-        if any(k in t for k in ("bonjour", "merci")):
-            return "fr"
-        return "en"
+from app.core.circlo_client import CircloClient
+
+router = APIRouter()
+llm = LLMClient()
+
+APP_BASE = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000")
 
 
-router = APIRouter(prefix="/agents", tags=["agents"])
-logger = logging.getLogger(__name__)
-
-# LLM client (no-op if OPENAI_API_KEY not configured)
-_llm = llm_module.LLMClient()
+class MessageIn(BaseModel):
+    message: str
+    user_id: str = "demo-user"
 
 
-def _detect_language(text: str) -> str:
-    try:
-        return detect(text or "")
-    except Exception:
-        return "en"
+def next_tuesday_slot(tz: str = "Asia/Singapore") -> Dict[str, str]:
+    """Compute next Tuesday 14:00-14:30 in given timezone and return ISO strings."""
+    tzinfo = ZoneInfo(tz)
+    now = datetime.now(tzinfo)
+    # find next Tuesday (weekday=1 where Monday=0)
+    days_ahead = (1 - now.weekday() + 7) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    target = (now + timedelta(days=days_ahead)).replace(hour=14, minute=0, second=0, microsecond=0)
+    start_iso = target.isoformat()
+    end_iso = (target + timedelta(minutes=30)).isoformat()
+    return {"start_iso": start_iso, "end_iso": end_iso}
 
 
-def _is_booking_intent(text: str) -> bool:
-    t = (text or "").lower()
-    keywords = ["book", "booking", "pesan", "pesan kamar", "booking kamar", "reserve", "kamar", "hotel"]
-    return any(k in t for k in keywords)
+async def execute_action(step: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """Execute a single action by calling local sub-agent endpoints or Circlo API.
 
-
-def _mock_search(platform: str, destination: str) -> list:
-    if platform == "PlatformA":
-        return [
-            {"name": f"{destination} Seaside Hotel A", "price": 50, "currency": "USD", "link": "https://platform-a.example/offer/1"},
-            {"name": f"{destination} Budget Inn A", "price": 30, "currency": "USD", "link": "https://platform-a.example/offer/2"},
-        ]
-    return [
-        {"name": f"{destination} Luxury Suites B", "price": 70, "currency": "USD", "link": "https://platform-b.example/offer/1"},
-        {"name": f"{destination} Cozy Stay B", "price": 35, "currency": "USD", "link": "https://platform-b.example/offer/2"},
-    ]
-
-
-def _summarize_offers_with_llm(destination: str, offers_a: list, offers_b: list, lang: str, persona: str = "You are Haruhi, a helpful travel assistant.") -> str:
-    system = llm_module.build_system_prompt(persona)
-    offers_text = "\n\n".join([
-        "Offers from Platform A:\n" + "\n".join([f"- {o['name']} ({o['price']} {o['currency']}) - {o['link']}" for o in offers_a]),
-        "Offers from Platform B:\n" + "\n".join([f"- {o['name']} ({o['price']} {o['currency']}) - {o['link']}" for o in offers_b]),
-    ])
-
-    prompt = (
-        f"User asked to find accommodations in {destination}. Compare the offers below and recommend the top 2 options overall and one budget pick.\n\n"
-        f"{offers_text}\n\nRespond in {lang}. Keep the answer concise and include reasons (price, location, value)."
-    )
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": prompt},
-    ]
-
-    reply = _llm.chat(messages) if _llm.available() else None
-    if reply:
-        return reply
-
-    # fallback summary
-    fallback_lines = [f"Comparison for {destination}:"]
-    fallback_lines.append("Platform A top: " + offers_a[0]["name"] + f" ({offers_a[0]['price']} {offers_a[0]['currency']})")
-    fallback_lines.append("Platform B top: " + offers_b[0]["name"] + f" ({offers_b[0]['price']} {offers_b[0]['currency']})")
-    fallback_lines.append("Budget pick: " + offers_a[1]["name"] + f" ({offers_a[1]['price']} {offers_a[1]['currency']})")
-    return "\n".join(fallback_lines)
-
-
-@router.post("/haruhi/hook")
-async def haruhi_hook(request: Request):
-    """Webhook endpoint.
-
-    - Default (JSON): returns {"response": "..."} for Circlo API.
-    - If client requests HTML (Accept: text/html) or uses ?format=html,
-      responds with a rendered HTML page with clarifying questions and
-      mocked offers. The HTML mode accepts form submissions (application/x-www-form-urlencoded)
-      where users can submit `area`, `budget`, and `guests` and receive an updated HTML result.
+    The function expects the app to be reachable at APP_BASE_URL; set that env var in deployment
+    if the service is not running on localhost:8000.
     """
-    # determine whether caller wants HTML
-    wants_html = ("text/html" in request.headers.get("accept", "")) or (request.query_params.get("format") == "html")
+    action = step.get("action")
+    args = step.get("args", {}) or {}
+    result: Dict[str, Any] = {"action": action, "ok": False, "details": None}
 
-    # read payload (support JSON and form posts)
-    payload = {}
-    ctype = request.headers.get("content-type", "")
-    if ctype.startswith("application/x-www-form-urlencoded") or ctype.startswith("multipart/form-data"):
-        form = await request.form()
-        payload = dict(form)
-    else:
+    async with httpx.AsyncClient(timeout=20.0) as hc:
         try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-
-    message = (payload or {}).get("message") or ""
-    user = (payload or {}).get("user") or {}
-    if isinstance(user, str):
-        user = {"name": user}
-    user_name = user.get("name") or user.get("id") or "Pengguna"
-
-    area = payload.get("area") or payload.get("destination")
-    budget = payload.get("budget")
-    guests = payload.get("guests")
-
-    lang = _detect_language(message)
-
-    # booking / search flow
-    if _is_booking_intent(message) or area:
-        dest_match = re.search(r"bali|ubud|kuta|seminyak|canggu|nusa dua", (message or "").lower())
-        destination = (area or (dest_match.group(0).title() if dest_match else "Bali"))
-
-        offers_a = _mock_search("PlatformA", destination)
-        offers_b = _mock_search("PlatformB", destination)
-
-        if wants_html:
-            # render an HTML reply with clarifying questions and offers
-            html_parts = [
-                "<html><head><meta charset='utf-8'><title>Haruhi — Rekomendasi Hotel</title></head>",
-                "<body style='font-family:Arial,Helvetica,sans-serif;padding:20px;'>",
-                f"<h2>Halo {user_name}, tentu, dengan senang hati saya akan membantu Anda.</h2>",
-                "<p>Sebelum saya memberikan rekomendasi yang paling sesuai, boleh saya tahu beberapa detail?</p>",
-                "<ul><li>Area (mis. Seminyak, Ubud, Canggu, Nusa Dua)</li><li>Perkiraan anggaran per malam</li><li>Untuk berapa orang?</li></ul>",
-                "<form method='post' action='?format=html'>",
-                "<label>Area: <input name='area' value='" + (destination or "Bali") + "'></label><br>",
-                "<label>Anggaran per malam (IDR): <input name='budget' value='" + (budget or "") + "'></label><br>",
-                "<label>Jumlah tamu: <input name='guests' value='" + (guests or "") + "'></label><br>",
-                "<input type='hidden' name='message' value='" + (message or "") + "'>",
-                "<button type='submit'>Kirim detail</button></form>",
-                "<p>Sambil menunggu jawaban Anda, berikut beberapa pilihan cepat untuk besok:</p>",
-                "<div>",
-            ]
-            for o in offers_a + offers_b:
-                price_text = f"Rp {int(o['price'] * 28000):,}" if isinstance(o.get('price'), (int, float)) else o.get('price')
-                source = "Booking.com" if 'PlatformA' in o.get('link', '') else "Agoda"
-                html_parts.append(
-                    f"<div style='border:1px solid #eee;padding:10px;margin-bottom:10px;border-radius:6px;'><h3>{o['name']}</h3><p><strong>Lokasi:</strong> {destination}</p><p>Mulai dari {price_text} / malam</p><p><em>Source: {source}</em></p><p><a href='{o['link']}' target='_blank' rel='noopener'>Lihat Ketersediaan</a></p></div>"
-                )
-            html_parts.extend(["</div>", "</body></html>"])
-            return HTMLResponse(content='\n'.join(html_parts))
-
-        # default JSON response
-        reply = _summarize_offers_with_llm(destination, offers_a, offers_b, lang)
-        return {"response": reply}
-
-    # general message -> LLM or fallback
-    persona = "You are Haruhi, a helpful and slightly playful assistant who provides clear answers."
-    system = llm_module.build_system_prompt(persona)
-    user_prompt = f"Reply concisely in {lang}. The user said: {message}. Keep tone helpful and give one actionable suggestion if appropriate."
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
-
-    reply = _llm.chat(messages) if _llm.available() else None
-
-    # Handle demo orchestration requests: find 3 AI experts in Singapore and schedule 30-min invites
-    demo_match = re.search(r"find.*3.*ai.*expert.*singapore|find.*3.*agentic.*ai.*experts.*singapore|send.*meeting.*invitations.*30|30[- ]?min", (message or "").lower())
-    if demo_match:
-        # call local orchestrator to perform the expert search and return an HTML summary
-        try:
-            # compute next Tuesday afternoon in Asia/Singapore (14:00 local) for a 30-min slot
-            tz = ZoneInfo("Asia/Singapore")
-            now = datetime.now(tz)
-            target_weekday = 1  # Tuesday (Mon=0)
-            days_ahead = (target_weekday - now.weekday()) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-            next_tuesday = (now + timedelta(days=days_ahead)).date()
-            start_dt = datetime.combine(next_tuesday, time(hour=14, minute=0), tzinfo=tz)
-            end_dt = start_dt + timedelta(minutes=30)
-            start_iso = start_dt.isoformat()
-            end_iso = end_dt.isoformat()
-
-            async with httpx.AsyncClient(timeout=30.0) as hc:
-                payload = {"message": message, "user": {"id": user.get("id") if isinstance(user, dict) else None}, "auto_schedule": True, "start_iso": start_iso, "end_iso": end_iso}
-                resp = await hc.post("http://127.0.0.1:8000/orchestrator/execute", json=payload)
+            if action == "search_experts":
+                query = args.get("query") or args.get("q") or "AI expert Singapore"
+                resp = await hc.post(f"{APP_BASE}/websearch/query", json={"q": query, "num": 3})
                 if resp.status_code == 200:
-                    # try to post a short confirmation to Circlo so the agent page shows activity
+                    result["ok"] = True
+                    result["details"] = resp.json().get("results", [])
+                else:
+                    result["details"] = {"status": resp.status_code, "text": resp.text}
+
+            elif action == "schedule_meetings":
+                attendees = args.get("attendees", [])
+                start_iso = args.get("start_iso")
+                end_iso = args.get("end_iso")
+                # if times not provided, compute a default next-Tuesday slot
+                if not (start_iso and end_iso):
+                    slot = next_tuesday_slot()
+                    start_iso = slot["start_iso"]
+                    end_iso = slot["end_iso"]
+
+                events = []
+                for a in attendees:
+                    ev_body = {"user_id": user_id, "summary": f"Intro meeting with {a}", "start_iso": start_iso, "end_iso": end_iso, "attendees": [a]}
                     try:
-                        client = CircloClient()
-                        await client.create_post({"title": "Orchestrator ran: find experts","body": f"Requested: {message}", "user_id": user.get("id") if isinstance(user, dict) else None})
-                        await client.close()
+                        resp = await hc.post(f"{APP_BASE}/gcal/create-event", json=ev_body, timeout=20.0)
+                        if resp.status_code in (200, 201):
+                            events.append({"attendee": a, "status": "created", "resp": resp.json()})
+                        else:
+                            events.append({"attendee": a, "status": "failed", "status_code": resp.status_code, "text": resp.text})
+                    except Exception as e:
+                        events.append({"attendee": a, "status": "error", "error": str(e)})
+
+                result["ok"] = True
+                result["details"] = events
+
+            elif action == "post_summary":
+                summary = args.get("summary") or args.get("body") or "No summary provided"
+                c = CircloClient()
+                try:
+                    post_resp = await c.create_post({"title": "Haruhi — Summary", "body": summary})
+                    result["ok"] = post_resp.get("status_code", 500) in (200, 201)
+                    result["details"] = post_resp
+                finally:
+                    try:
+                        await c.close()
                     except Exception:
                         pass
-                    # Build a richer confirmation HTML including CTA to user's Google Calendar + orchestrator output
-                    orchestrator_html = resp.text
-                    confirm_html = ["<html><head><meta charset='utf-8'><title>Haruhi — Demo Result</title></head><body style='font-family:Arial,Helvetica,sans-serif;padding:20px;'>"]
-                    confirm_html.append(f"<h2>Orchestrator ran for your request</h2>")
-                    confirm_html.append(f"<p>I've searched for 3 AI experts in Singapore and attempted to schedule 30-minute introductions on <strong>{start_dt.strftime('%A, %d %B %Y')}</strong> at <strong>{start_dt.strftime('%H:%M')}</strong> (Asia/Singapore).</p>")
-                    confirm_html.append("<p>You can open your Google Calendar to review the invites:</p>")
-                    confirm_html.append("<p><a href='https://calendar.google.com/calendar/r' target='_blank' style='background:#0f9d58;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;'>Open Google Calendar</a></p>")
-                    confirm_html.append("<hr/><h3>Details from orchestrator:</h3>")
-                    confirm_html.append(orchestrator_html)
-                    confirm_html.append("</body></html>")
-                    return HTMLResponse(content='\n'.join(confirm_html))
+
+            else:
+                result["details"] = {"error": "unknown action"}
+
+        except Exception as e:
+            result["details"] = {"exception": str(e)}
+
+    return result
+
+
+def build_final_text(summary: str, execution_results: List[Dict[str, Any]]) -> str:
+    parts = [f"Ringkasan: {summary}"]
+    for er in execution_results:
+        act = er.get("step", {}).get("action")
+        parts.append(f"Action: {act}")
+        parts.append(f"Result: {json.dumps(er.get('result', {}), ensure_ascii=False)}")
+    return "\n\n".join(parts)
+
+
+@router.post("/agents/haruhi/hook")
+async def haruhi_hook(body: MessageIn):
+    user_id = body.user_id or "demo-user"
+    user_text = body.message.strip()
+
+    # 1) Ask LLM to produce a structured plan (JSON)
+    system_prompt = """
+You are Haruhi, a concise, helpful Indonesian assistant that turns one user instruction into a small executable plan.
+Return ONLY a JSON object matching this schema:
+
+{
+  "plan": [
+    {"action": "search_experts", "args": {"query": "<query string>"}},
+    {"action": "schedule_meetings", "args": {"attendees": ["email1","email2"], "start_iso":"...", "end_iso":"..."}},
+    {"action": "post_summary", "args": {"summary":"..."}}
+  ],
+  "summary": "short Indonesian sentence summarizing what you will do"
+}
+
+If the user input is a simple greeting, return:
+{"greeting": "Halo... (Indonesian greeting text)"}
+
+Respond only with valid JSON. Do not include any additional text.
+"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text}
+    ]
+
+    try:
+        plan_text = llm.chat(messages)
+    except Exception as e:
+        return {"response": f"Haruhi LLM error: {e}"}
+
+    parsed = None
+    try:
+        parsed = json.loads(plan_text) if plan_text else None
+    except Exception:
+        # retry once asking for strict JSON
+        retry_msgs = messages + [{"role": "assistant", "content": plan_text or ""}, {"role":"system","content":"Previous response was not valid JSON. Please respond ONLY with valid JSON that matches the schema exactly."}]
+        try:
+            plan_text = llm.chat(retry_msgs)
+            parsed = json.loads(plan_text) if plan_text else None
         except Exception:
-            # fall through to LLM / fallback reply
-            pass
-    if wants_html:
-        # render html reply
-        html = reply or (f"Haruhi Agent di sini - saya menerima pesan Anda: {message}" if lang == 'id' else f"Haruhi Agent here - I received your message: {message}")
-        body = f"<html><body style='font-family:Arial,Helvetica,sans-serif;padding:20px;'><p>{html}</p></body></html>"
-        return HTMLResponse(content=body)
+            parsed = None
 
-    if reply:
-        return {"response": reply}
+    if not parsed:
+        # fallback: return a friendly acknowledgement
+        return {"response": f"Haruhi di sini — saya menerima pesan Anda: {user_text}"}
 
-    responses = {
-        "en": f"Haruhi Agent here - I received your message: {message}",
-        "id": f"Haruhi Agent di sini - saya menerima pesan Anda: {message}",
-        "es": f"Agente Haruhi aquí - recibí tu mensaje: {message}",
-        "fr": f"Agent Haruhi ici - j'ai reçu votre message: {message}",
-    }
-    return {"response": responses.get(lang, responses["en"])}
+    if "greeting" in parsed:
+        return {"response": parsed["greeting"]}
 
+    plan = parsed.get("plan", [])
+    summary = parsed.get("summary", "Saya akan membantu menyelesaikan permintaan Anda.")
 
-@router.post("/register")
-async def register_haruhi(request: Request, client: CircloClient = Depends(get_circlo_client)):
-    """Register a Haruhi Agent on Circlo using the server's CircloClient.
+    # 2) Execute each step synchronously and collect results
+    execution_results = []
+    for step in plan:
+        res = await execute_action(step, user_id)
+        execution_results.append({"step": step, "result": res})
 
-    Optional JSON body accepted:
-      { "username": "haruhi-agent-1", "niche": "Business", "avatar_url": "...", "endpoint": "https://..." }
-    """
-    payload = await request.json() if request._body else {}
-    username = payload.get("username") or f"haruhi-agent-{int(time.time())}"
-    body = {
-        "name": payload.get("name", "Haruhi Agent"),
-        "username": username,
-        "niche": payload.get("niche", "General"),
-        "avatar_url": payload.get("avatar_url", ""),
-    }
-    if payload.get("endpoint"):
-        body["endpoint"] = payload.get("endpoint")
+    # 3) Build a plain summary of results (structured)
+    final_structured = build_final_text(summary, execution_results)
 
-    resp = await client.create_agent(body)
-    if resp.get("error"):
-        raise HTTPException(status_code=resp.get("status_code", 502), detail=resp["error"])
-    return resp["data"]
+    # 4) Ask LLM to render a polished Indonesian confirmation message including CTAs
+    polish_system = "You are Haruhi, an Indonesian assistant. Rephrase the following execution summary into a friendly, professional Indonesian confirmation message. Include clear CTAs for the user to verify calendar invites and next steps. Keep it concise (3-6 sentences)."
+    polish_msgs = [
+        {"role": "system", "content": polish_system},
+        {"role": "user", "content": final_structured}
+    ]
 
+    try:
+        polished_reply = llm.chat(polish_msgs)
+    except Exception:
+        polished_reply = final_structured
 
-@router.post("/{agent_id}/update")
-async def update_agent_route(agent_id: str, request: Request, client: CircloClient = Depends(get_circlo_client)):
-    """Update agent fields (name, niche, avatar_url) using CircloClient.update_agent."""
-    payload = await request.json() if request._body else {}
-    # only pass known fields
-    body = {}
-    for k in ("name", "niche", "avatar_url"):
-        if k in payload:
-            body[k] = payload[k]
-
-    if not body:
-        raise HTTPException(status_code=400, detail="No update fields provided")
-
-    resp = await client.update_agent(agent_id, body)
-    if resp.get("error"):
-        raise HTTPException(status_code=resp.get("status_code", 502), detail=resp["error"])
-    return resp["data"]
-
-    responses = {
-        "en": f"Haruhi Agent here - I received your message: {message}",
-        "id": f"Haruhi Agent di sini - saya menerima pesan Anda: {message}",
-        "es": f"Agente Haruhi aquí - recibí tu mensaje: {message}",
-        "fr": f"Agent Haruhi ici - j'ai reçu votre message: {message}",
-    }
-
-    reply = responses.get(lang, responses["en"])
-    return {"response": reply}
-
-
-@router.post("/register")
-async def register_haruhi(request: Request, client: CircloClient = Depends(get_circlo_client)):
-    """Register a Haruhi Agent on Circlo using the server's CircloClient.
-
-    Optional JSON body accepted:
-      { "username": "haruhi-agent-1", "niche": "Business", "avatar_url": "...", "endpoint": "https://..." }
-    """
-    payload = await request.json() if request._body else {}
-    username = payload.get("username") or f"haruhi-agent-{int(time.time())}"
-    body = {
-        "name": payload.get("name", "Haruhi Agent"),
-        "username": username,
-        "niche": payload.get("niche", "General"),
-        "avatar_url": payload.get("avatar_url", ""),
-    }
-    if payload.get("endpoint"):
-        body["endpoint"] = payload.get("endpoint")
-
-    resp = await client.create_agent(body)
-    if resp.get("error"):
-        raise HTTPException(status_code=resp.get("status_code", 502), detail=resp["error"])
-    return resp["data"]
-
-
-@router.post("/{agent_id}/update")
-async def update_agent_route(agent_id: str, request: Request, client: CircloClient = Depends(get_circlo_client)):
-    """Update agent fields (name, niche, avatar_url) using CircloClient.update_agent."""
-    payload = await request.json() if request._body else {}
-    # only pass known fields
-    body = {}
-    for k in ("name", "niche", "avatar_url"):
-        if k in payload:
-            body[k] = payload[k]
-
-    if not body:
-        raise HTTPException(status_code=400, detail="No update fields provided")
-
-    resp = await client.update_agent(agent_id, body)
-    if resp.get("error"):
-        raise HTTPException(status_code=resp.get("status_code", 502), detail=resp["error"])
-    return resp["data"]
+    # return polished reply and execution details (CTA links included in polished text if any)
+    return {"response": polished_reply, "details": execution_results}
