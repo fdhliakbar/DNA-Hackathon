@@ -37,3 +37,36 @@ try:
 except Exception:
 	# if agent router is not present yet, ignore; it will be picked up on reload
 	logging.getLogger(__name__).warning("Agent router not available (yet)")
+
+# include coordinator router (provides HTML aggregation views)
+try:
+	from app.api.routers import coordinator
+	app.include_router(coordinator.router)
+except Exception:
+	logging.getLogger(__name__).warning("Coordinator router not available (yet)")
+
+# include orchestrator/router for high-level orchestration
+try:
+	from app.api.routers import orchestrator
+	app.include_router(orchestrator.router)
+except Exception:
+	logging.getLogger(__name__).warning("Orchestrator router not available (yet)")
+
+# include websearch and gcal routers
+try:
+	from app.api.routers import websearch
+	app.include_router(websearch.router)
+except Exception:
+	logging.getLogger(__name__).warning("WebSearch router not available (yet)")
+
+try:
+	from app.api.routers import gcal
+	app.include_router(gcal.router)
+except Exception:
+	logging.getLogger(__name__).warning("GCal router not available (yet)")
+
+try:
+	from app.api.routers import marketing
+	app.include_router(marketing.router)
+except Exception:
+	logging.getLogger(__name__).warning("Marketing router not available (yet)")
