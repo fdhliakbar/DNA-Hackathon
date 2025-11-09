@@ -1,3 +1,9 @@
+# Ensure .env is loaded as early as possible so modules that read os.getenv() see values
+try:
+	from dotenv import load_dotenv
+	load_dotenv()
+except Exception:
+	pass
 from fastapi import FastAPI
 import os
 from fastapi.responses import Response
