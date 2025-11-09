@@ -28,6 +28,8 @@ class LLMClient:
         self.model = model
         self._client = None
         self._uses_new_sdk = False
+        # store last error (string) to help diagnostics
+        self.last_error: Optional[str] = None
 
         if self.api_key and OpenAIClient:
             try:
@@ -98,6 +100,7 @@ class LLMClient:
                 # modern SDK provides output_text helper
                 text = getattr(resp, "output_text", None)
                 if text:
+                    self.last_error = None
                     return text
                 # fallback parse
                 try:
@@ -110,6 +113,7 @@ class LLMClient:
                             # join any text fragments
                             parts = [c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "output_text"]
                             if parts:
+                                self.last_error = None
                                 return "".join(parts)
                 except Exception:
                     pass
@@ -123,9 +127,15 @@ class LLMClient:
                     temperature=temperature,
                 )
                 text = resp.choices[0].message.content
+                self.last_error = None
                 return text
 
         except Exception as e:
+            # record error for diagnostics and return None so callers can fallback
+            try:
+                self.last_error = str(e)
+            except Exception:
+                self.last_error = "LLM error"
             logger.exception("LLM chat failed: %s", e)
             return None
 

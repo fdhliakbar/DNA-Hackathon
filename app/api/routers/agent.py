@@ -142,10 +142,15 @@ Respond only with valid JSON. Do not include any additional text.
         {"role": "user", "content": user_text}
     ]
 
-    try:
-        plan_text = llm.chat(messages)
-    except Exception as e:
-        return {"response": f"Haruhi LLM error: {e}"}
+    # ask LLM for a plan
+    plan_text = llm.chat(messages)
+    # if the LLM client returned no text, include diagnostic if available
+    if not plan_text:
+        err = getattr(llm, "last_error", None)
+        if err:
+            # do not expose secrets; provide actionable hint
+            return {"response": f"Haruhi: LLM tidak tersedia (error: {err}). Silakan periksa konfigurasi OPENAI_API_KEY dan OPENAI_PROJECT_ID."}
+        return {"response": f"Haruhi di sini — saya menerima pesan Anda: {user_text}"}
 
     parsed = None
     try:
