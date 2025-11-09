@@ -32,9 +32,8 @@ async def root_redirect():
 def _ensure_extra_schemas(openapi_schema: Dict):
 	comps = openapi_schema.setdefault("components", {}).setdefault("schemas", {})
 	try:
-		# import here to avoid import-time side effects
-		from app.api.routers.gcal import SendOAuthPayload
-		from app.api.routers.marketing import MarketingRequest
+		# Import the small, dependency-free schema definitions
+		from app.api.schemas import SendOAuthPayload, MarketingRequest
 
 		# Add schemas if missing
 		if "SendOAuthPayload" not in comps:

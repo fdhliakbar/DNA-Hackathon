@@ -123,9 +123,7 @@ async def create_event(request: Request):
     return JSONResponse(content={"status": "created", "event": created})
 
 
-class SendOAuthPayload(BaseModel):
-    user_id: str
-    message: str | None = None
+from app.api.schemas import SendOAuthPayload
 
 
 @router.post("/send-oauth")

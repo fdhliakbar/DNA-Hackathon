@@ -1,17 +1,10 @@
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List
+from app.api.schemas import MarketingRequest
 from app.core.circlo_client import CircloClient
 import asyncio
 
 router = APIRouter(prefix="/marketing", tags=["marketing"])
-
-
-class MarketingRequest(BaseModel):
-    goal: str
-    user_id: str | None = None
-    register_agents: bool = False
 
 
 @router.post("/generate")
