@@ -4,12 +4,26 @@ from fastapi.responses import Response
 import logging
 from app.api.routers import circlo
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 
 # Enable basic logging so our client logger messages appear in the uvicorn console
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Circlo API Integration")
 app.include_router(circlo.router)
+
+
+# Convenience redirects for usability on deployed instances
+@app.get("/openapi")
+async def openapi_redirect():
+	"""Redirect /openapi to the OpenAPI JSON produced by FastAPI."""
+	return RedirectResponse(url="/openapi.json")
+
+
+@app.get("/")
+async def root_redirect():
+	"""Redirect root to the Swagger UI for quick exploration."""
+	return RedirectResponse(url="/docs")
 
 # If the user hasn't placed a haruhi.jpg into app/static, provide a small
 # fallback SVG served at the same path so the avatar URL is reachable immediately.
