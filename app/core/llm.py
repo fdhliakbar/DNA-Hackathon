@@ -3,11 +3,6 @@ import logging
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
-
-# Lightweight wrapper for OpenAI. Supports both the modern openai>=1.0.0 SDK
-# (OpenAI class + Responses API) and falls back to the older ChatCompletion call
-# if available. If no API key is configured the client returns None so callers
-# can fall back to canned replies.
 try:
     # modern SDK exposes OpenAI client class
     from openai import OpenAI as OpenAIClient  # type: ignore
