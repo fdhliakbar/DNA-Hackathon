@@ -5,6 +5,8 @@ import logging
 from app.api.routers import circlo
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.openapi.utils import get_openapi
+from typing import Dict
 
 # Enable basic logging so our client logger messages appear in the uvicorn console
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +26,36 @@ async def openapi_redirect():
 async def root_redirect():
 	"""Redirect root to the Swagger UI for quick exploration."""
 	return RedirectResponse(url="/docs")
+
+
+# Ensure certain Pydantic models are present in OpenAPI components.
+def _ensure_extra_schemas(openapi_schema: Dict):
+	comps = openapi_schema.setdefault("components", {}).setdefault("schemas", {})
+	try:
+		# import here to avoid import-time side effects
+		from app.api.routers.gcal import SendOAuthPayload
+		from app.api.routers.marketing import MarketingRequest
+
+		# Add schemas if missing
+		if "SendOAuthPayload" not in comps:
+			comps["SendOAuthPayload"] = SendOAuthPayload.schema(ref_template="#/components/schemas/{model}")
+		if "MarketingRequest" not in comps:
+			comps["MarketingRequest"] = MarketingRequest.schema(ref_template="#/components/schemas/{model}")
+	except Exception:
+		# if imports fail, don't crash OpenAPI generation
+		pass
+
+
+def custom_openapi():
+	if app.openapi_schema:
+		return app.openapi_schema
+	openapi_schema = get_openapi(title=app.title, version="1.0.0", routes=app.routes)
+	_ensure_extra_schemas(openapi_schema)
+	app.openapi_schema = openapi_schema
+	return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # If the user hasn't placed a haruhi.jpg into app/static, provide a small
 # fallback SVG served at the same path so the avatar URL is reachable immediately.
